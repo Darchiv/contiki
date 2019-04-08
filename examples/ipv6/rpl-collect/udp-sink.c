@@ -76,7 +76,31 @@ collect_common_net_print(void)
 void
 collect_common_send(void)
 {
-  /* Server never sends */
+  /* Construct a collect message and print it on the serial line
+  so that collect-view catches the sink node's data. */
+
+  static uint8_t seqno;
+  struct collect_view_data_msg msg;
+
+  /* struct collect_neighbor *n; */
+  linkaddr_t parent;
+  linkaddr_t sender;
+
+  memset(&msg, 0, sizeof(msg));
+  seqno++;
+  if(seqno == 0) {
+    /* Wrap to 128 to identify restarts */
+    seqno = 128;
+  }
+
+  linkaddr_copy(&parent, &linkaddr_null);
+
+  collect_view_construct_message(&msg, &parent, 0, 0, 0, 0);
+
+  sender.u8[0] = uip_ds6_if.addr_list[0].ipaddr.u8[15];
+  sender.u8[1] = uip_ds6_if.addr_list[0].ipaddr.u8[14];
+
+  collect_common_recv(&sender, seqno, 0, (uint8_t*) &msg, sizeof(msg));
 }
 /*---------------------------------------------------------------------------*/
 void
