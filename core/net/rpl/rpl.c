@@ -328,6 +328,13 @@ rpl_purge_dags(void)
 }
 /*---------------------------------------------------------------------------*/
 void
+rpl_measure_attainability(void (*cb)(uint8_t sink))
+{
+  rpl_ss_set_sink_cb(cb);
+  sss_output(1, 0);
+}
+/*---------------------------------------------------------------------------*/
+void
 rpl_init(void)
 {
   uip_ipaddr_t rplmaddr;

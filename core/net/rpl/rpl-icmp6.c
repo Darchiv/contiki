@@ -77,9 +77,16 @@ static void dis_input(void);
 static void dio_input(void);
 static void dao_input(void);
 static void dao_ack_input(void);
+static void sss_input(void);
+static void sss_ack_input(void);
+static void shr_input(void);
+static void saa_input(void);
 
 static void dao_output_target_seq(rpl_parent_t *parent, uip_ipaddr_t *prefix,
                                   uint8_t lifetime, uint8_t seq_no);
+
+static void send_shr_message(void *p);
+static void saa_output(uint16_t seq_num, uint16_t attainability);
 
 /* some debug callbacks useful when debugging RPL networks */
 #ifdef RPL_DEBUG_DIO_INPUT
@@ -92,6 +99,15 @@ void RPL_DEBUG_DAO_OUTPUT(rpl_parent_t *);
 
 static uint8_t dao_sequence = RPL_LOLLIPOP_INIT;
 
+static rpl_ss_t ss_state;
+
+static struct ctimer sss_delay;
+static struct ctimer sss_ack_delay;
+static struct ctimer shr_delay;
+static struct ctimer saa_delay;
+static struct ctimer ss_process;
+static struct ctimer ss_decision_delay;
+
 #if RPL_WITH_MULTICAST
 static uip_mcast6_route_t *mcast_group;
 #endif
@@ -101,6 +117,10 @@ UIP_ICMP6_HANDLER(dis_handler, ICMP6_RPL, RPL_CODE_DIS, dis_input);
 UIP_ICMP6_HANDLER(dio_handler, ICMP6_RPL, RPL_CODE_DIO, dio_input);
 UIP_ICMP6_HANDLER(dao_handler, ICMP6_RPL, RPL_CODE_DAO, dao_input);
 UIP_ICMP6_HANDLER(dao_ack_handler, ICMP6_RPL, RPL_CODE_DAO_ACK, dao_ack_input);
+UIP_ICMP6_HANDLER(sss_handler, ICMP6_RPL, RPL_CODE_SSS, sss_input);
+UIP_ICMP6_HANDLER(sss_ack_handler, ICMP6_RPL, RPL_CODE_SSS_ACK, sss_ack_input);
+UIP_ICMP6_HANDLER(shr_handler, ICMP6_RPL, RPL_CODE_SHR, shr_input);
+UIP_ICMP6_HANDLER(saa_handler, ICMP6_RPL, RPL_CODE_SAA, saa_input);
 /*---------------------------------------------------------------------------*/
 
 #if RPL_WITH_DAO_ACK
@@ -137,7 +157,7 @@ prepare_for_dao_fwd(uint8_t sequence, uip_ds6_route_t *rep)
 #endif /* RPL_WITH_STORING */
 /*---------------------------------------------------------------------------*/
 static int
-get_global_addr(uip_ipaddr_t *addr)
+get_ipaddr(uip_ipaddr_t *addr, uint8_t global)
 {
   int i;
   int state;
@@ -146,7 +166,7 @@ get_global_addr(uip_ipaddr_t *addr)
     state = uip_ds6_if.addr_list[i].state;
     if(uip_ds6_if.addr_list[i].isused &&
        (state == ADDR_TENTATIVE || state == ADDR_PREFERRED)) {
-      if(!uip_is_addr_linklocal(&uip_ds6_if.addr_list[i].ipaddr)) {
+      if(!uip_is_addr_linklocal(&uip_ds6_if.addr_list[i].ipaddr) != !global) {
         memcpy(addr, &uip_ds6_if.addr_list[i].ipaddr, sizeof(uip_ipaddr_t));
         return 1;
       }
@@ -1071,7 +1091,7 @@ handle_dao_retransmission(void *ptr)
   PRINTF("RPL: will retransmit DAO - seq:%d trans:%d\n", instance->my_dao_seqno,
          instance->my_dao_transmissions);
 
-  if(get_global_addr(&prefix) == 0) {
+  if(get_ipaddr(&prefix, 1) == 0) {
     return;
   }
 
@@ -1092,7 +1112,7 @@ dao_output(rpl_parent_t *parent, uint8_t lifetime)
   /* Destination Advertisement Object */
   uip_ipaddr_t prefix;
 
-  if(get_global_addr(&prefix) == 0) {
+  if(get_ipaddr(&prefix, 1) == 0) {
     PRINTF("RPL: No global address set for this node - suppressing DAO\n");
     return;
   }
@@ -1363,6 +1383,527 @@ dao_ack_output(rpl_instance_t *instance, uip_ipaddr_t *dest, uint8_t sequence,
 #endif /* RPL_WITH_DAO_ACK */
 }
 /*---------------------------------------------------------------------------*/
+static int
+is_ss_sequence_known(rpl_ss_t *ss_state, uint16_t seq)
+{
+  unsigned int i;
+
+  /* Zero is not allowed to be sent in SS ICMP messages. */
+  if (seq == 0) {
+    return 0;
+  }
+
+  for (i = 0; i < RPL_SS_MAX_SEQ; i++) {
+    if (ss_state->seqs[i].seq_no == seq) {
+      return 1;
+    }
+  }
+
+  return 0;
+}
+/*---------------------------------------------------------------------------*/
+static int
+add_ss_sequence(rpl_ss_t *ss_state, uint16_t seq)
+{
+  unsigned int i;
+
+  /* Zero is not allowed to be sent in SS ICMP messages. */
+  if (seq == 0) {
+    return 0;
+  }
+
+  for (i = 0; i < RPL_SS_MAX_SEQ; i++) {
+    if (ss_state->seqs[i].seq_no == 0) {
+      ss_state->seqs[i].seq_no = seq;
+      return 1;
+    }
+  }
+
+  return 0;
+}
+/*---------------------------------------------------------------------------*/
+static int
+set_ss_awaiting_ack(rpl_ss_t *ss_state, uint16_t seq, uint16_t hops, uip_ipaddr_t *parent, uint8_t awaiting)
+{
+  unsigned int i;
+
+  /* Zero is not allowed to be sent in SS ICMP messages. */
+  if (seq == 0) {
+    return 0;
+  }
+
+  for (i = 0; i < RPL_SS_MAX_SEQ; i++) {
+    if (ss_state->seqs[i].seq_no == seq) {
+      ss_state->seqs[i].children_num = 0;
+      ss_state->seqs[i].hops = hops;
+      ss_state->seqs[i].parent = *parent;
+      ss_state->seqs[i].is_awaiting_ack = awaiting;
+      return 1;
+    }
+  }
+
+  return 0;
+}
+/*---------------------------------------------------------------------------*/
+static int
+inc_ss_children(rpl_ss_t *ss_state, uint16_t seq)
+{
+  unsigned int i;
+
+  /* Zero is not allowed to be sent in SS ICMP messages. */
+  if (seq == 0) {
+    return 0;
+  }
+
+  for (i = 0; i < RPL_SS_MAX_SEQ; i++) {
+    if (ss_state->seqs[i].seq_no == seq) {
+      ss_state->seqs[i].children_num++;
+      return 1;
+    }
+  }
+
+  return 0;
+}
+/*---------------------------------------------------------------------------*/
+static struct rpl_ss_seq*
+get_ss_by_seq(rpl_ss_t *ss_state, uint16_t seq)
+{
+  unsigned int i;
+
+  for (i = 0; i < RPL_SS_MAX_SEQ; i++) {
+    if (ss_state->seqs[i].seq_no == seq) {
+      return &ss_state->seqs[i];
+    }
+  }
+
+  return NULL;
+}
+/*---------------------------------------------------------------------------*/
+static void
+sss_ack_expired(void *p)
+{
+  struct rpl_ss_seq *seq = p;
+
+  if (seq->children_num == 0) {
+    printf("RPL: No children for this leaf-node. Sending SHR back to ");
+    uip_debug_ipaddr_print(&seq->parent);
+    printf(", seq = %x\n", seq->seq_no);
+
+    seq->final_hops = seq->hops;
+
+    send_shr_message((void*) seq->seq_no);
+  } else {
+    printf("RPL: Found %u children. Not a leaf.\n", seq->children_num);
+
+    seq->final_hops = 0;
+  }
+}
+/*---------------------------------------------------------------------------*/
+static int
+set_ss_ack_expire(rpl_ss_t *ss_state, uint16_t seq)
+{
+  unsigned int i;
+
+  /* Zero is not allowed to be sent in SS ICMP messages. */
+  if (seq == 0) {
+    return 0;
+  }
+
+  for (i = 0; i < RPL_SS_MAX_SEQ; i++) {
+    if (ss_state->seqs[i].seq_no == seq) {
+      ctimer_set(&ss_state->seqs[i].leaf_expiry, ((clock_time_t) CLOCK_SECOND * 5) + ((clock_time_t) CLOCK_SECOND / 200) / random_rand(), sss_ack_expired, &ss_state->seqs[i]);
+      return 1;
+    }
+  }
+
+  return 0;
+}
+/*---------------------------------------------------------------------------*/
+static void
+sss_input(void)
+{
+  uint16_t own_seq;
+
+  {
+    uip_ipaddr_t seq;
+
+    if (get_ipaddr(&seq, 0) == 0) {
+      //printf("RPL: No local address available - suppressing SSS\n");
+      uip_clear_buf();
+      return;
+    }
+
+    own_seq = (seq.u8[sizeof(uip_ipaddr_t) - 2] << 8) | seq.u8[sizeof(uip_ipaddr_t) - 1];
+  }
+
+  uint16_t seq = ((uint16_t) UIP_ICMP_PAYLOAD[0] << 8) | UIP_ICMP_PAYLOAD[1];
+  uint16_t hops = ((uint16_t) UIP_ICMP_PAYLOAD[2] << 8) | UIP_ICMP_PAYLOAD[3];
+
+  if (!is_ss_sequence_known(&ss_state, seq) && seq != 0 && seq != own_seq) {
+    add_ss_sequence(&ss_state, seq);
+
+    /* Sink Selection Solicitation */
+    printf("RPL: Received an SSS from ");
+    uip_debug_ipaddr_print(&UIP_IP_BUF->srcipaddr);
+    printf(" for seq %x with hops %u\n", seq, hops);
+
+    set_ss_awaiting_ack(&ss_state, seq, hops, &UIP_IP_BUF->srcipaddr, 1);
+    sss_ack_output(seq);
+
+    set_ss_ack_expire(&ss_state, seq);
+
+    sss_output(hops + 1, seq);
+  } else {
+    struct rpl_ss_seq *ss_seq = get_ss_by_seq(&ss_state, seq);
+
+    if (ss_seq != NULL && hops < ss_seq->hops) {
+      ss_seq->hops = hops;
+      ss_seq->parent = UIP_IP_BUF->srcipaddr;
+      printf("RPL: Updated SSS with %u hops, new parent ", hops);
+      uip_debug_ipaddr_print(&UIP_IP_BUF->srcipaddr);
+      printf("\n");
+    } else {
+      printf("RPL: An SSS for seq %x was ignored\n", seq);
+    }
+
+  }
+
+  uip_clear_buf();
+}
+/*---------------------------------------------------------------------------*/
+static void
+ss_process_completed(void *p)
+{
+  if (ss_state.cumulative_hops == 0) {
+    printf("RPL: No other leafs found.\n");
+  } else {
+    //ss_state.own_attainability = ((uint32_t) ss_state.cumulative_hops * 32) / ((uint32_t) ss_state.paths_num);
+    ss_state.own_attainability = ss_state.cumulative_hops;
+    printf("RPL: Attainability: %u\n", ss_state.own_attainability);
+
+    saa_output(0, ss_state.own_attainability);
+  }
+}
+/*---------------------------------------------------------------------------*/
+static void
+send_sss_message(void *p)
+{
+  unsigned char *buffer;
+  uip_ipaddr_t addr;
+  struct rpl_ss_msg *msg = p;
+
+  /*
+   * Sink Selection Solicitation:
+   *  2 byte unsigned int - sequence number
+   *  2 byte unsigned int - hops
+   */
+
+  buffer = UIP_ICMP_PAYLOAD;
+  buffer[0] = msg->seq_num >> 8;
+  buffer[1] = msg->seq_num & 0xFF;
+  buffer[2] = msg->hops >> 8;
+  buffer[3] = msg->hops & 0xFF;
+
+  uip_create_linklocal_rplnodes_mcast(&addr);
+
+  printf("RPL: Sending an SSS to ");
+  uip_debug_ipaddr_print(&addr);
+  printf(" from %x\n", msg->seq_num);
+
+  uip_icmp6_send(&addr, ICMP6_RPL, RPL_CODE_SSS, 4);
+}
+/*---------------------------------------------------------------------------*/
+void
+sss_output(uint16_t hops, uint16_t seq_num)
+{
+  if (seq_num == 0) {
+    /* Sending initiated by the origin. */
+    uip_ipaddr_t seq;
+
+    if (get_ipaddr(&seq, 0) == 0) {
+      //printf("RPL: No local address available - suppressing SSS\n");
+      return;
+    }
+
+    seq_num = (seq.u8[sizeof(uip_ipaddr_t) - 2] << 8) | seq.u8[sizeof(uip_ipaddr_t) - 1];
+
+    ctimer_set(&ss_process, (clock_time_t) CLOCK_SECOND * 20, ss_process_completed, (void*) seq_num);
+  }
+
+  /* TODO: Use appropriate struct rpl_ss_seq instead of that. */
+  ss_state.msg[0].hops = hops;
+  ss_state.msg[0].seq_num = seq_num;
+
+  /* Mitigate transmission collisions - CSMA ContikiMAC does not help when Cooja sends frames simultaneously. */
+  ctimer_set(&sss_delay, ((clock_time_t) CLOCK_SECOND / 200) / random_rand() + ((clock_time_t) CLOCK_SECOND / 100), send_sss_message, &ss_state.msg[0]);
+}
+/*---------------------------------------------------------------------------*/
+static void
+sss_ack_input(void)
+{
+  unsigned int i;
+  uip_ipaddr_t dest;
+  uint16_t seq = ((uint16_t) UIP_ICMP_PAYLOAD[0] << 8) | UIP_ICMP_PAYLOAD[1];
+
+  /* Assume the right addr. */
+  if (get_ipaddr(&dest, 0) == 0) {
+    //printf("RPL: No local address available - suppressing SSS-ACK\n");
+    uip_clear_buf();
+    return;
+  }
+
+  /* Check the destination. */
+  for (i = 0; i < sizeof(dest); i++) {
+    if (UIP_ICMP_PAYLOAD[2 + i] != dest.u8[i]) {
+      uip_clear_buf();
+      return;
+    }
+  }
+
+  inc_ss_children(&ss_state, seq);
+
+  printf("RPL: Received an SSS-ACK from ");
+  uip_debug_ipaddr_print(&UIP_IP_BUF->srcipaddr);
+  printf(" for seq %x\n", seq);
+
+  uip_clear_buf();
+}
+/*---------------------------------------------------------------------------*/
+static void
+send_sss_ack_message(void *p)
+{
+  unsigned int i;
+  unsigned char *buffer;
+  uip_ipaddr_t mcast;
+  struct rpl_ss_seq* seq = get_ss_by_seq(&ss_state, (uint16_t) p);
+
+  /*
+   * Sink Selection Solicitation Acknowledgement:
+   *  2 byte unsigned int - sequence number
+   */
+
+  buffer = UIP_ICMP_PAYLOAD;
+  buffer[0] = seq->seq_no >> 8;
+  buffer[1] = seq->seq_no & 0xFF;
+
+  /* No routing available so no unicast possible. Must embed the IPv6. */
+  for (i = 0; i < sizeof(seq->parent); i++) {
+    buffer[2 + i] = seq->parent.u8[i];
+  }
+
+  printf("RPL: Sending an SSS-ACK to ");
+  uip_debug_ipaddr_print(&seq->parent);
+  printf(" from %x\n", seq->seq_no);
+
+  /* Send a multicast actually. */
+  uip_create_linklocal_rplnodes_mcast(&mcast);
+  uip_icmp6_send(&mcast, ICMP6_RPL, RPL_CODE_SSS_ACK, 18);
+}
+/*---------------------------------------------------------------------------*/
+void
+sss_ack_output(uint16_t seq_num)
+{
+  /* Mitigate transmission collisions - CSMA ContikiMAC does not help when Cooja sends frames simultaneously. */
+  ctimer_set(&sss_ack_delay, ((clock_time_t) CLOCK_SECOND / 200) / random_rand() + 2 * ((clock_time_t) CLOCK_SECOND / 100), send_sss_ack_message, (void*) seq_num);
+}
+/*---------------------------------------------------------------------------*/
+static void
+send_shr_message(void *p)
+{
+  unsigned int i;
+  uip_ipaddr_t mcast;
+  unsigned char *buffer;
+  struct rpl_ss_seq* seq = get_ss_by_seq(&ss_state, (uint16_t) p);
+
+  /*
+   * Sink Hops Response:
+   *  2 byte unsigned int - sequence number
+   *  2 byte unsigned int - hops
+   */
+
+  buffer = UIP_ICMP_PAYLOAD;
+  buffer[0] = seq->seq_no >> 8;
+  buffer[1] = seq->seq_no & 0xFF;
+  buffer[2] = seq->final_hops >> 8;
+  buffer[3] = seq->final_hops & 0xFF;
+
+  seq->final_hops = 0;
+
+  /* No routing available so no unicast possible. Must embed the IPv6. */
+  for (i = 0; i < sizeof(seq->parent); i++) {
+    buffer[4 + i] = seq->parent.u8[i];
+  }
+
+  /* Send a multicast actually. */
+  uip_create_linklocal_rplnodes_mcast(&mcast);
+  uip_icmp6_send(&mcast, ICMP6_RPL, RPL_CODE_SHR, 20);
+}
+/*---------------------------------------------------------------------------*/
+static void
+shr_input(void)
+{
+  unsigned int i;
+  uip_ipaddr_t dest;
+  uint16_t seq = ((uint16_t) UIP_ICMP_PAYLOAD[0] << 8) | UIP_ICMP_PAYLOAD[1];
+  uint16_t hops = ((uint16_t) UIP_ICMP_PAYLOAD[2] << 8) | UIP_ICMP_PAYLOAD[3];
+
+  /* Assume the right addr. */
+  if (get_ipaddr(&dest, 0) == 0) {
+    //printf("RPL: No local address available - suppressing SSS-ACK\n");
+    uip_clear_buf();
+    return;
+  }
+
+  /* Check the destination. */
+  for (i = 0; i < sizeof(dest); i++) {
+    if (UIP_ICMP_PAYLOAD[4 + i] != dest.u8[i]) {
+      uip_clear_buf();
+      return;
+    }
+  }
+
+  /* Is this the source node? */
+  uint16_t own_seq;
+
+  {
+    uip_ipaddr_t localhost;
+
+    if (get_ipaddr(&localhost, 0) == 0) {
+      //printf("RPL: No local address available - suppressing SSS\n");
+      uip_clear_buf();
+      return;
+    }
+
+    own_seq = (localhost.u8[sizeof(uip_ipaddr_t) - 2] << 8) | localhost.u8[sizeof(uip_ipaddr_t) - 1];
+  }
+
+  if (seq == own_seq) {
+    ss_state.cumulative_hops += hops;
+    //ss_state.paths_num += 1;
+
+    printf("RPL: An SHR arrived at the source node from ");
+    uip_debug_ipaddr_print(&UIP_IP_BUF->srcipaddr);
+    printf(", hops %u, seq %x, cumulative_hops %u\n", hops, seq, ss_state.cumulative_hops);
+  } else {
+    struct rpl_ss_seq* ss_seq = get_ss_by_seq(&ss_state, seq);
+
+    printf("RPL: Received an SHR from ");
+    uip_debug_ipaddr_print(&UIP_IP_BUF->srcipaddr);
+    printf(", hops %u, seq %x\n", hops, seq);
+
+    /* Include the hops number of this node only once. */
+    /* As this implementation relies on delayed sending routines,
+       the hops must be accumulated, so that the received SHRs are
+       not lost when an SHR has already been slated for transmission. */
+    if (ss_seq->has_sent_own_hops == 0) {
+      ss_seq->has_sent_own_hops = 1;
+      ss_seq->final_hops += ss_seq->hops + hops;
+    } else {
+      ss_seq->final_hops += hops;
+    }
+
+    /* Mitigate transmission collisions - CSMA ContikiMAC does not help when Cooja sends frames simultaneously. */
+    ctimer_set(&shr_delay, ((clock_time_t) CLOCK_SECOND / 200) / random_rand() + 2 * ((clock_time_t) CLOCK_SECOND / 100), send_shr_message, (void*) seq);
+  }
+
+  uip_clear_buf();
+}
+/*---------------------------------------------------------------------------*/
+static void
+ss_decision(void *p)
+{
+  printf("foreign_attainability = %u, own_attainability = %u\n", ss_state.foreign_attainability, ss_state.own_attainability);
+
+  if (ss_state.foreign_attainability > ss_state.own_attainability) {
+    if (ss_state.sink_cb) {
+      ss_state.sink_cb(1);
+    }
+
+    printf("RPL: Became a sink.\n");
+  } else {
+    if (ss_state.sink_cb) {
+      ss_state.sink_cb(0);
+    }
+  }
+}
+/*---------------------------------------------------------------------------*/
+void
+rpl_ss_set_sink_cb(void (*cb)(uint8_t sink))
+{
+  ss_state.sink_cb = cb;
+}
+/*---------------------------------------------------------------------------*/
+static void
+send_saa_message(void *p)
+{
+  unsigned int i;
+  uip_ipaddr_t mcast;
+  unsigned char *buffer;
+
+  /*
+   * Sink Attainability Advertisement:
+   *  2 byte unsigned int - sequence number
+   *  2 byte unsigned int - attainability
+   */
+
+  buffer = UIP_ICMP_PAYLOAD;
+  buffer[0] = ss_state.msg[3].seq_num >> 8;
+  buffer[1] = ss_state.msg[3].seq_num & 0xFF;
+  buffer[2] = ss_state.msg[3].attainability >> 8;
+  buffer[3] = ss_state.msg[3].attainability & 0xFF;
+
+  /* Send a multicast actually. */
+  uip_create_linklocal_rplnodes_mcast(&mcast);
+  uip_icmp6_send(&mcast, ICMP6_RPL, RPL_CODE_SAA, 4);
+}
+/*---------------------------------------------------------------------------*/
+static void
+saa_output(uint16_t seq_num, uint16_t attainability)
+{
+  uip_ipaddr_t mcast;
+  unsigned char *buffer;
+
+  if (seq_num == 0) {
+    uip_ipaddr_t seq;
+
+    if (get_ipaddr(&seq, 0) == 0) {
+      return;
+    }
+
+    seq_num = (seq.u8[sizeof(uip_ipaddr_t) - 2] << 8) | seq.u8[sizeof(uip_ipaddr_t) - 1];
+    ctimer_set(&ss_decision_delay, (clock_time_t) CLOCK_SECOND * 10, ss_decision, NULL);
+  }
+
+  ss_state.msg[3].attainability = attainability;
+  ss_state.msg[3].seq_num = seq_num;
+
+  /* Mitigate transmission collisions - CSMA ContikiMAC does not help when Cooja sends frames simultaneously. */
+  ctimer_set(&saa_delay, ((clock_time_t) CLOCK_SECOND / 200) / random_rand() + 2 * ((clock_time_t) CLOCK_SECOND / 100), send_saa_message, NULL);
+}
+/*---------------------------------------------------------------------------*/
+static void
+saa_input(void)
+{
+  uint16_t seq = ((uint16_t) UIP_ICMP_PAYLOAD[0] << 8) | UIP_ICMP_PAYLOAD[1];
+  uint16_t attainability = ((uint16_t) UIP_ICMP_PAYLOAD[2] << 8) | UIP_ICMP_PAYLOAD[3];
+  struct rpl_ss_seq* ss_seq = get_ss_by_seq(&ss_state, seq);
+
+  if (ss_seq != NULL && !ss_seq->got_saa) {
+    ss_seq->got_saa = 1U;
+
+    printf("RPL: Received an SAA from ");
+    uip_debug_ipaddr_print(&UIP_IP_BUF->srcipaddr);
+    printf(", attainability %u, seq %x\n", attainability, seq);
+
+    if (attainability < ss_state.foreign_attainability || ss_state.foreign_attainability == 0)
+      ss_state.foreign_attainability = attainability;
+
+    saa_output(seq, attainability);
+  }
+
+  uip_clear_buf();
+}
+/*---------------------------------------------------------------------------*/
 void
 rpl_icmp6_register_handlers()
 {
@@ -1370,6 +1911,10 @@ rpl_icmp6_register_handlers()
   uip_icmp6_register_input_handler(&dio_handler);
   uip_icmp6_register_input_handler(&dao_handler);
   uip_icmp6_register_input_handler(&dao_ack_handler);
+  uip_icmp6_register_input_handler(&sss_handler);
+  uip_icmp6_register_input_handler(&sss_ack_handler);
+  uip_icmp6_register_input_handler(&shr_handler);
+  uip_icmp6_register_input_handler(&saa_handler);
 }
 /*---------------------------------------------------------------------------*/
 

@@ -47,7 +47,7 @@
 #include <ctype.h>
 
 static unsigned long time_offset;
-static int send_active = 1;
+static int send_active = 0;
 
 #ifndef PERIOD
 #define PERIOD 60

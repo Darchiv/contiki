@@ -73,6 +73,10 @@
 #define RPL_CODE_DIO                   0x01   /* DAG Information Option */
 #define RPL_CODE_DAO                   0x02   /* Destination Advertisement Option */
 #define RPL_CODE_DAO_ACK               0x03   /* DAO acknowledgment */
+#define RPL_CODE_SSS                   0x40   /* Sink Selection Solicitation */
+#define RPL_CODE_SSS_ACK               0x41   /* Sink Selection Solicitation Acknowledgement */
+#define RPL_CODE_SHR                   0x42   /* Sink Hop Response */
+#define RPL_CODE_SAA                   0x43   /* Sink Attainability Advertisement */
 #define RPL_CODE_SEC_DIS               0x80   /* Secure DIS */
 #define RPL_CODE_SEC_DIO               0x81   /* Secure DIO */
 #define RPL_CODE_SEC_DAO               0x82   /* Secure DAO */
@@ -330,6 +334,34 @@ typedef struct rpl_stats rpl_stats_t;
 extern rpl_stats_t rpl_stats;
 #endif
 
+#define RPL_SS_MAX_SEQ 20
+
+struct rpl_ss {
+  void (*sink_cb)(uint8_t sink);
+  struct rpl_ss_seq {
+    uint16_t seq_no;
+    uint16_t children_num;
+    uint16_t hops;
+    uint16_t final_hops;
+    uip_ipaddr_t parent;
+    uint8_t is_awaiting_ack;
+    uint8_t got_saa;
+    uint8_t has_sent_own_hops;
+    struct ctimer leaf_expiry;
+  } seqs[RPL_SS_MAX_SEQ];
+  struct rpl_ss_msg {
+    uip_ipaddr_t addr;
+    uint16_t seq_num;
+    uint16_t hops;
+    uint16_t attainability;
+  } msg[4];
+  uint16_t cumulative_hops;
+  uint16_t paths_num;
+  uint16_t own_attainability;
+  uint16_t foreign_attainability;
+};
+typedef struct rpl_ss rpl_ss_t;
+
 
 /*---------------------------------------------------------------------------*/
 /* RPL macros. */
@@ -350,6 +382,8 @@ void dio_output(rpl_instance_t *, uip_ipaddr_t *uc_addr);
 void dao_output(rpl_parent_t *, uint8_t lifetime);
 void dao_output_target(rpl_parent_t *, uip_ipaddr_t *, uint8_t lifetime);
 void dao_ack_output(rpl_instance_t *, uip_ipaddr_t *, uint8_t, uint8_t);
+void sss_output(uint16_t hops, uint16_t seq_num);
+void sss_ack_output(uint16_t seq_num);
 void rpl_icmp6_register_handlers(void);
 uip_ds6_nbr_t *rpl_icmp6_update_nbr_table(uip_ipaddr_t *from,
                                           nbr_table_reason_t r, void *data);
@@ -402,6 +436,8 @@ void rpl_reset_periodic_timer(void);
 /* Route poisoning. */
 void rpl_poison_routes(rpl_dag_t *, rpl_parent_t *);
 
+/* Sink selection */
+void rpl_ss_set_sink_cb(void (*cb)(uint8_t sink));
 
 rpl_instance_t *rpl_get_default_instance(void);
 
